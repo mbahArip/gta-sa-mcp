@@ -40,6 +40,7 @@
 #include <CWeather.h>
 #include <CTaskSimpleStandStill.h>
 #include <CTaskComplexDie.h>
+#include <CMenuManager.h>
 #include <extensions/PoolIterator.h>
 #include <enums/eWeaponType.h>
 #include <enums/eTaskType.h>
@@ -630,8 +631,33 @@ static void pipeThread() {
                 int id = (int)jsonGetNum(line, "id");
                 std::string cmd = jsonGetStr(line, "cmd");
 
-                std::lock_guard<std::mutex> lk(g_mutex);
-                g_cmdQueue.push_back({ id, cmd, line });
+                // Scene detection reads only static globals — safe on this thread
+                // even during splash, menu, pause, or loading.
+                bool menuActive = FrontEndMenuManager.m_bMenuActive;
+                bool playerReady = CWorld::Players[0].m_pPed != nullptr;
+                const char* scene = menuActive ? (playerReady ? "paused" : "menu")
+                                               : (playerReady ? "in_game" : "loading");
+
+                if (cmd == "game_state") {
+                    // Answered here so scene queries work before gameplay starts.
+                    std::ostringstream o;
+                    o << "{\"id\":" << id << ",\"ok\":true,\"data\":{\"scene\":\"" << scene
+                      << "\",\"menuVisible\":" << (menuActive ? "true" : "false")
+                      << ",\"playerReady\":" << (playerReady ? "true" : "false") << "}}";
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    g_respQueue.push_back({ o.str() });
+                } else if (std::string(scene) != "in_game") {
+                    // Don't queue gameplay commands while not in gameplay — they'd
+                    // either hang until timeout or execute stale after loading.
+                    std::ostringstream o;
+                    o << "{\"id\":" << id << ",\"ok\":false,\"error\":\"game not in gameplay (scene: "
+                      << scene << ")\"}";
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    g_respQueue.push_back({ o.str() });
+                } else {
+                    std::lock_guard<std::mutex> lk(g_mutex);
+                    g_cmdQueue.push_back({ id, cmd, line });
+                }
             }
         }
 
