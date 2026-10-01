@@ -64,6 +64,60 @@ export function registerGameTools(server: McpServer, cfg: Config) {
   );
 
   server.tool(
+    "key_tap",
+    "Simulate a keyboard key press inside the game for N frames — tests plugin hotkey handlers without touching the real keyboard.",
+    {
+      keyCode: z.number().int().min(1).max(255).describe("Windows VK_ code (e.g. 0x70=VK_F1, 0x31='1', 0x09=VK_TAB)"),
+      frames:  z.number().int().min(1).max(60).optional().describe("Frames to hold the key down (default 2)"),
+    },
+    async ({ keyCode, frames }) => {
+      const data = await send("key_tap", { keyCode, frames: frames ?? 2 });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "screenshot",
+    "Capture the GTA SA window to a PNG and return the file path — lets you visually inspect plugin effects.",
+    {},
+    async () => {
+      const ts = Date.now();
+      const outPath = `${process.env["TEMP"] ?? "C:\\Temp"}\\gta-sa-mcp-shot-${ts}.png`;
+      const script = `
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string c, string t);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  public struct RECT { public int Left, Top, Right, Bottom; }
+}
+"@
+$h = [W]::FindWindow($null, "GTA: San Andreas")
+if ($h -eq [IntPtr]::Zero) { Write-Output "ERROR window not found"; exit 1 }
+$r = New-Object W+RECT
+[void][W]::GetWindowRect($h, [ref]$r)
+$w = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
+if ($w -le 0 -or $ht -le 0) { Write-Output "ERROR invalid window size"; exit 1 }
+$bmp = New-Object System.Drawing.Bitmap($w, $ht)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)
+$bmp.Save("${outPath}", [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose(); $bmp.Dispose()
+Write-Output "OK"
+`;
+      const proc = Bun.spawn(["powershell", "-NoProfile", "-Command", script], { stdout: "pipe", stderr: "pipe" });
+      await proc.exited;
+      const out = (await new Response(proc.stdout).text()).trim();
+      if (out !== "OK") {
+        return { content: [{ type: "text", text: `Screenshot failed: ${out}` }] };
+      }
+      return { content: [{ type: "text", text: outPath }] };
+    }
+  );
+
+  server.tool(
     "game_kill",
     "Kill GTA SA process and remove the sentinel file.",
     {},

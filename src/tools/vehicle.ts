@@ -43,4 +43,43 @@ export function registerVehicleTools(server: McpServer) {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
+
+  server.tool(
+    "vehicle_remove",
+    "Remove a vehicle from the world (cleanup). Fails if CJ is inside it.",
+    {
+      handle: z.number().int().optional().describe("Vehicle pool handle (omit to use CJ's current vehicle)"),
+    },
+    async ({ handle }) => {
+      const data = await send("vehicle_remove", { handle });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "vehicle_teleport",
+    "Teleport a vehicle to world coordinates.",
+    {
+      handle: z.number().int().optional().describe("Vehicle pool handle (omit to use CJ's current vehicle)"),
+      x: z.number().describe("World X"),
+      y: z.number().describe("World Y"),
+      z: z.number().describe("World Z"),
+    },
+    async ({ handle, x, y, z }) => {
+      const data = await send("vehicle_teleport", { handle, x, y, z });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "vehicle_fix",
+    "Repair a vehicle (full health, un-flipped).",
+    {
+      handle: z.number().int().optional().describe("Vehicle pool handle (omit to use CJ's current vehicle)"),
+    },
+    async ({ handle }) => {
+      const data = await send("vehicle_fix", { handle });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
 }

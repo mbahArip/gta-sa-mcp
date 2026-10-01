@@ -37,11 +37,15 @@
 #include <CWanted.h>
 #include <CTaskComplexWanderStandard.h>
 #include <CTaskComplexKillPedOnFoot.h>
+#include <CTaskComplexEnterCarAsDriver.h>
+#include <CTaskSimpleRunNamedAnim.h>
+#include <CExplosion.h>
 #include <CWeather.h>
 #include <CTaskSimpleStandStill.h>
 #include <CTaskComplexDie.h>
 #include <CMenuManager.h>
 #include <extensions/PoolIterator.h>
+#include <CWeaponInfo.h>
 #include <enums/eWeaponType.h>
 #include <enums/eTaskType.h>
 #include <enums/eAnimations.h>
@@ -49,10 +53,16 @@
 #include <windows.h>
 #include <string>
 #include <deque>
+#include <vector>
 #include <mutex>
 #include <thread>
 #include <sstream>
 #include <iomanip>
+
+// ---- injected-key state (processed per frame on the game thread) ----------
+
+struct PendingKey { int vk; int framesLeft; };
+static std::vector<PendingKey> g_pendingKeys;
 
 // ---- simple JSON builder ------------------------------------------------
 
@@ -220,6 +230,17 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
+    // ---- player_enter_vehicle ----
+    if (cmd == "player_enter_vehicle") {
+        CPlayerPed* player = FindPlayerPed(0);
+        if (!player || !player->m_pIntelligence) return "null";
+        CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
+        if (!veh) return "null";
+        CTask* t = new CTaskComplexEnterCarAsDriver(veh);
+        player->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
+        return "{}";
+    }
+
     // ---- vehicle_spawn ----
     if (cmd == "vehicle_spawn") {
         CPlayerPed* player = FindPlayerPed(0);
@@ -325,6 +346,42 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
+    // ---- vehicle_remove ----
+    if (cmd == "vehicle_remove") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        if (veh == FindPlayerVehicle(0, false)) return "{\"error\":\"cannot remove the vehicle CJ is in\"}";
+        CWorld::Remove(veh);
+        delete veh;
+        return "{}";
+    }
+
+    // ---- vehicle_teleport ----
+    if (cmd == "vehicle_teleport") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        CVector pos = { (float)jsonGetNum(json, "x"), (float)jsonGetNum(json, "y"), (float)jsonGetNum(json, "z") };
+        pos.z += veh->GetHeightAboveRoad();
+        veh->Teleport(pos, false);
+        return "{}";
+    }
+
+    // ---- vehicle_fix ----
+    if (cmd == "vehicle_fix") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        veh->m_fHealth = 1000.0f;
+        veh->SetOrientation(0.0f, 0.0f, veh->GetHeading()); // un-flip
+        veh->UpdateRwMatrix();
+        return "{}";
+    }
+
     // ---- ped_spawn ----
     if (cmd == "ped_spawn") {
         CPlayerPed* player = FindPlayerPed(0);
@@ -392,6 +449,53 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
+    // ---- ped_remove ----
+    if (cmd == "ped_remove") {
+        CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
+        if (!ped) return "null";
+        if (ped == FindPlayerPed(0)) return "{\"error\":\"cannot remove the player\"}";
+        CWorld::Remove(ped);
+        delete ped;
+        return "{}";
+    }
+
+    // ---- ped_teleport ----
+    if (cmd == "ped_teleport") {
+        CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
+        if (!ped) return "null";
+        CVector pos = { (float)jsonGetNum(json, "x"), (float)jsonGetNum(json, "y"), (float)jsonGetNum(json, "z") };
+        ped->Teleport(pos, false);
+        return "{}";
+    }
+
+    // ---- ped_give_weapon ----
+    if (cmd == "ped_give_weapon") {
+        CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
+        if (!ped) return "null";
+        int wt = (int)jsonGetNum(json, "weaponType");
+        int ammo = (int)jsonGetNum(json, "ammo", 100);
+        bool setActive = jsonGetBool(json, "setActive", true);
+
+        // Resolve the weapon's model via weapon info and stream it in first —
+        // GiveWeapon does not load models itself.
+        CWeaponInfo* wi = CWeaponInfo::GetWeaponInfo((eWeaponType)wt);
+        if (!wi || wi->m_nModelId <= 0) return "{\"error\":\"invalid weaponType\"}";
+        int modelId = wi->m_nModelId;
+        unsigned char oldFlags = CStreaming::ms_aInfoForModel[modelId].m_nFlags;
+        CStreaming::RequestModel(modelId, GAME_REQUIRED);
+        CStreaming::LoadAllRequestedModels(false);
+        if (CStreaming::ms_aInfoForModel[modelId].m_nLoadState != LOADSTATE_LOADED)
+            return "{\"error\":\"weapon model failed to load\"}";
+        if (!(oldFlags & GAME_REQUIRED)) {
+            CStreaming::SetModelIsDeletable(modelId);
+            CStreaming::SetModelTxdIsDeletable(modelId);
+        }
+
+        ped->GiveWeapon((eWeaponType)wt, ammo, true);
+        if (setActive) ped->SetCurrentWeapon((eWeaponType)wt);
+        return "{}";
+    }
+
     // ---- ped_set_task ----
     if (cmd == "ped_set_task") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
@@ -415,6 +519,18 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
         } else if (task == "hands_up") {
             t = new CTaskSimpleStandStill(60000, false, false, 4.0f);
+            ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
+        } else if (task == "enter_vehicle" && jsonHasKey(json, "vehicleHandle")) {
+            CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
+            if (!veh) return "null";
+            t = new CTaskComplexEnterCarAsDriver(veh);
+            ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
+        } else if (task == "play_anim") {
+            std::string animName = jsonGetStr(json, "animName");
+            std::string animLib  = jsonGetStr(json, "animLib", "ped");
+            int animTime = (int)jsonGetNum(json, "animTime", 5000);
+            if (animName.empty()) return "{\"error\":\"animName required\"}";
+            t = new CTaskSimpleRunNamedAnim(animName.c_str(), animLib.c_str(), 0, 4.0f, animTime, false, false, false, false);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
         } else if (task == "die") {
             t = new CTaskComplexDie(WEAPONTYPE_UNARMED, 0, ANIM_DEFAULT_KO_SKID_FRONT, 4.0f, 1.0f, false, false, 0, false);
@@ -446,6 +562,35 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
     if (cmd == "world_set_weather") {
         int wid = (int)jsonGetNum(json, "weatherId");
         CWeather::ForceWeatherNow((short)wid);
+        return "{}";
+    }
+
+    // ---- world_set_timescale ----
+    if (cmd == "world_set_timescale") {
+        float scale = (float)jsonGetNum(json, "scale", 1.0);
+        if (scale < 0.0f) scale = 0.0f;
+        if (scale > 10.0f) scale = 10.0f;
+        CTimer::ms_fTimeScale = scale;
+        return "{\"applied\":" + fmtf(scale) + "}";
+    }
+
+    // ---- world_explosion ----
+    if (cmd == "world_explosion") {
+        CVector pos = { (float)jsonGetNum(json, "x"), (float)jsonGetNum(json, "y"), (float)jsonGetNum(json, "z") };
+        int type = (int)jsonGetNum(json, "type", 0);
+        CExplosion::AddExplosion(nullptr, nullptr, (eExplosionType)type, pos, 0, 1, 1.0f, 1);
+        return "{}";
+    }
+
+    // ---- key_tap ----
+    if (cmd == "key_tap") {
+        int vk = (int)jsonGetNum(json, "keyCode");
+        int frames = (int)jsonGetNum(json, "frames", 2);
+        if (frames < 1) frames = 1;
+        if (frames > 60) frames = 60;
+        if (vk <= 0 || vk > 255) return "{\"error\":\"keyCode must be 1-255 (Windows VK_*)\"}";
+        keybd_event((BYTE)vk, 0, 0, 0);
+        g_pendingKeys.push_back({ vk, frames });
         return "{}";
     }
 
@@ -700,6 +845,16 @@ public:
         std::thread(pipeThread).detach();
 
         Events::gameProcessEvent += [] {
+            // Release injected keys after their frame count expires
+            for (auto it = g_pendingKeys.begin(); it != g_pendingKeys.end();) {
+                if (--it->framesLeft <= 0) {
+                    keybd_event((BYTE)it->vk, 0, KEYEVENTF_KEYUP, 0);
+                    it = g_pendingKeys.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             std::lock_guard<std::mutex> lk(g_mutex);
             while (!g_cmdQueue.empty()) {
                 BridgeCommand c = g_cmdQueue.front();

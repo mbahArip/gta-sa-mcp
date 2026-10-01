@@ -49,4 +49,31 @@ export function registerWorldTools(server: McpServer) {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
+
+  server.tool(
+    "world_set_timescale",
+    "Set game time scale for slow-motion or freeze (0 = frozen, 1 = normal, up to 10). Useful for observing transient plugin states.",
+    {
+      scale: z.number().min(0).max(10).describe("Time scale (0=frozen, 1=normal)"),
+    },
+    async ({ scale }) => {
+      const data = await send("world_set_timescale", { scale });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "world_explosion",
+    "Trigger an explosion at world coordinates — for testing damage/impact event handlers in plugins.",
+    {
+      x:    z.number().describe("World X"),
+      y:    z.number().describe("World Y"),
+      z:    z.number().describe("World Z"),
+      type: z.number().int().min(0).max(25).optional().describe("eExplosionType (default 0 = grenade)"),
+    },
+    async ({ x, y, z, type }) => {
+      const data = await send("world_explosion", { x, y, z, type: type ?? 0 });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
 }

@@ -39,12 +39,63 @@ export function registerPedTools(server: McpServer) {
     "ped_set_task",
     "Assign a task to a spawned NPC.",
     {
-      handle: z.number().int().describe("Ped pool handle"),
-      task:   z.enum(["wander", "follow_player", "attack_player", "flee_player", "hands_up", "die"])
-               .describe("Task to assign"),
+      handle:        z.number().int().describe("Ped pool handle"),
+      task:          z.enum(["wander", "follow_player", "attack_player", "flee_player", "hands_up", "die", "enter_vehicle", "play_anim"])
+                       .describe("Task to assign"),
+      vehicleHandle: z.number().int().optional().describe("Target vehicle (required for enter_vehicle)"),
+      animName:      z.string().optional().describe("Animation name (required for play_anim, e.g. 'dance_loop')"),
+      animLib:       z.string().optional().describe("Animation library (default 'ped', e.g. 'DANCING')"),
+      animTime:      z.number().int().optional().describe("Anim duration in ms (default 5000)"),
     },
-    async ({ handle, task }) => {
-      const data = await send("ped_set_task", { handle, task });
+    async ({ handle, task, vehicleHandle, animName, animLib, animTime }) => {
+      const data = await send("ped_set_task", { handle, task, vehicleHandle, animName, animLib, animTime });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "ped_remove",
+    "Remove a spawned NPC from the world (cleanup). Fails for the player ped.",
+    {
+      handle: z.number().int().describe("Ped pool handle"),
+    },
+    async ({ handle }) => {
+      const data = await send("ped_remove", { handle });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "ped_teleport",
+    "Teleport a ped to world coordinates.",
+    {
+      handle: z.number().int().describe("Ped pool handle"),
+      x: z.number().describe("World X"),
+      y: z.number().describe("World Y"),
+      z: z.number().describe("World Z"),
+    },
+    async ({ handle, x, y, z }) => {
+      const data = await send("ped_teleport", { handle, x, y, z });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "ped_give_weapon",
+    "Give a weapon to a spawned NPC (or any ped by handle) and optionally make it the active weapon.",
+    {
+      handle:     z.number().int().describe("Ped pool handle from ped_spawn"),
+      weaponType: z.number().int().describe("eWeaponType ID (e.g. 22=pistol, 30=AK47, 31=M4)"),
+      ammo:       z.number().int().min(1).optional().describe("Ammo count (default 100)"),
+      setActive:  z.boolean().optional().describe("Switch ped to this weapon (default true)"),
+    },
+    async ({ handle, weaponType, ammo, setActive }) => {
+      const data = await send("ped_give_weapon", {
+        handle,
+        weaponType,
+        ammo: ammo ?? 100,
+        setActive: setActive ?? true,
+      });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );

@@ -44,6 +44,18 @@ export function registerPlayerTools(server: McpServer) {
   );
 
   server.tool(
+    "player_enter_vehicle",
+    "Make CJ walk to a vehicle and get in as driver (task-based). Use vehicle_spawn's returned handle.",
+    {
+      vehicleHandle: z.number().int().describe("Vehicle pool handle from vehicle_spawn"),
+    },
+    async ({ vehicleHandle }) => {
+      const data = await send("player_enter_vehicle", { vehicleHandle });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
     "player_give_weapon",
     "Give CJ a weapon with ammo.",
     {
