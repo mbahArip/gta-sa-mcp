@@ -892,21 +892,28 @@ public:
         g_fastboot = true; // auto-start a new game and skip the intro cutscene
         std::thread(pipeThread).detach();
 
+        // Fires every frame during the frontend (splash screens + menu) — the
+        // only reliable hook for bootstrapping straight into a new game.
+        Events::menuDrawingEvent += [] {
+            if (!g_fastboot) return;
+            bool playerReady = CWorld::Players[0].m_pPed != nullptr;
+            if (!playerReady && ++g_fastbootTimer >= 20) {
+                g_fastbootTimer = 0;
+                // Same function the "New Game" menu button calls.
+                FrontEndMenuManager.DoSettingsBeforeStartingAGame();
+            }
+        };
+
         Events::gameProcessEvent += [] {
-            // ---- fast-boot: auto-start new game + skip intro cutscene ----
+            // ---- fast-boot: skip intro cutscene once gameplay exists ----
+            // (The splash/menu phase is handled in menuDrawingEvent, which
+            // fires during the frontend; gameProcessEvent only runs in-game.)
             if (g_fastboot) {
                 bool menuActive = FrontEndMenuManager.m_bMenuActive;
                 bool playerReady = CWorld::Players[0].m_pPed != nullptr;
                 bool cutsceneActive = CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing;
 
-                if (menuActive && !playerReady) {
-                    // Frontend (splash or menu) still up — trigger a new game
-                    // directly, same path the "New Game" button uses.
-                    if (++g_fastbootTimer >= 20) {
-                        g_fastbootTimer = 0;
-                        FrontEndMenuManager.DoSettingsBeforeStartingAGame();
-                    }
-                } else if (!menuActive && playerReady && cutsceneActive) {
+                if (!menuActive && playerReady && cutsceneActive) {
                     // Intro cutscene — flag it skipped every few frames until done.
                     if (++g_fastbootTimer >= 5) {
                         g_fastbootTimer = 0;

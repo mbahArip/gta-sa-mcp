@@ -99,7 +99,8 @@ public class W {
   public struct RECT { public int Left, Top, Right, Bottom; }
 }
 "@
-$h = [W]::FindWindow($null, "GTA: San Andreas")
+$proc = Get-Process gta_sa -ErrorAction Stop
+$h = $proc.MainWindowHandle
 if ($h -eq [IntPtr]::Zero) { Write-Output "ERROR window not found"; exit 1 }
 $r = New-Object W+RECT
 [void][W]::GetWindowRect($h, [ref]$r)
