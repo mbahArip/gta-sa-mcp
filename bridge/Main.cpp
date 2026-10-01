@@ -43,6 +43,7 @@
 #include <extensions/PoolIterator.h>
 #include <enums/eWeaponType.h>
 #include <enums/eTaskType.h>
+#include <enums/eAnimations.h>
 
 #include <windows.h>
 #include <string>
@@ -126,21 +127,22 @@ static std::deque<Response> g_respQueue;
 static std::mutex           g_mutex;
 
 // ---- ped/vehicle handle map ---------------------------------------------
-// Pool index used as handle (stable within a session)
+// SCM-style refs (slot index << 8 | generation) so stale handles to recycled
+// pool slots resolve to nullptr instead of silently hitting the wrong entity.
 
 static CPed*    HandleToPed(int handle) {
-    if (!CPools::ms_pPedPool || handle < 0 || handle >= CPools::ms_pPedPool->m_nSize) return nullptr;
-    return CPools::ms_pPedPool->GetAt(handle);
+    if (!CPools::ms_pPedPool) return nullptr;
+    return CPools::ms_pPedPool->GetAtRef(handle);
 }
 static CVehicle* HandleToVehicle(int handle) {
-    if (!CPools::ms_pVehiclePool || handle < 0 || handle >= CPools::ms_pVehiclePool->m_nSize) return nullptr;
-    return CPools::ms_pVehiclePool->GetAt(handle);
+    if (!CPools::ms_pVehiclePool) return nullptr;
+    return CPools::ms_pVehiclePool->GetAtRef(handle);
 }
 static int PedToHandle(CPed* ped) {
-    return CPools::ms_pPedPool ? CPools::ms_pPedPool->GetIndex(ped) : -1;
+    return CPools::ms_pPedPool ? CPools::ms_pPedPool->GetRef(ped) : -1;
 }
 static int VehicleToHandle(CVehicle* veh) {
-    return CPools::ms_pVehiclePool ? CPools::ms_pVehiclePool->GetIndex(veh) : -1;
+    return CPools::ms_pVehiclePool ? CPools::ms_pVehiclePool->GetRef(veh) : -1;
 }
 
 // ---- command handlers (run on game thread via gameProcessEvent) ----------
@@ -160,7 +162,7 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
           << "\"heading\":" << fmtf(player->GetHeading() * 57.2957795f) << ","
           << "\"health\":" << fmtf(player->m_fHealth) << ","
           << "\"armour\":" << fmtf(player->m_fArmour) << ","
-          << "\"wanted\":" << (player->m_pPlayerData ? (int)player->m_pPlayerData->m_pWanted->m_nWantedLevel : 0) << ","
+          << "\"wanted\":" << (player->m_pPlayerData && player->m_pPlayerData->m_pWanted ? (int)player->m_pPlayerData->m_pWanted->m_nWantedLevel : 0) << ","
           << "\"money\":" << CWorld::Players[0].m_nMoney << ","
           << "\"interior\":" << (int)player->m_nAreaCode << ","
           << "\"inVehicle\":" << (player->bInVehicle ? "true" : "false") << ","
@@ -230,6 +232,12 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         CStreaming::LoadAllRequestedModels(false);
         if (CStreaming::ms_aInfoForModel[modelId].m_nLoadState != LOADSTATE_LOADED)
             return "null";
+        // Restore deletable state before touching the model — the spawned vehicle
+        // holds its own reference, so streaming won't evict a model in use.
+        if (!(oldFlags & GAME_REQUIRED)) {
+            CStreaming::SetModelIsDeletable(modelId);
+            CStreaming::SetModelTxdIsDeletable(modelId);
+        }
 
         auto* mi = CModelInfo::GetModelInfo(modelId);
         if (!mi || mi->GetModelType() != MODEL_INFO_VEHICLE) return "null";
@@ -277,11 +285,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         veh->UpdateRwMatrix();
         CTheScripts::ClearSpaceForMissionEntity(veh->GetPosition(), veh);
         veh->ProcessControl();
-
-        if (!(oldFlags & GAME_REQUIRED)) {
-            CStreaming::SetModelIsDeletable(modelId);
-            CStreaming::SetModelTxdIsDeletable(modelId);
-        }
 
         int handle = VehicleToHandle(veh);
         std::ostringstream o;
@@ -413,8 +416,10 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
             t = new CTaskSimpleStandStill(60000, false, false, 4.0f);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
         } else if (task == "die") {
-            t = new CTaskComplexDie(WEAPONTYPE_UNARMED, 0, 4, 4.0f, 1.0f, false, false, 0, false);
+            t = new CTaskComplexDie(WEAPONTYPE_UNARMED, 0, ANIM_DEFAULT_KO_SKID_FRONT, 4.0f, 1.0f, false, false, 0, false);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
+        } else {
+            return "{\"error\":\"unknown task or missing player\"}";
         }
         return "{}";
     }
@@ -445,6 +450,7 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
 
     // ---- world_pool_dump ----
     if (cmd == "world_pool_dump") {
+        if (!CPools::ms_pPedPool || !CPools::ms_pVehiclePool) return "null";
         float radius = (float)jsonGetNum(json, "radius", 50.0);
         CPlayerPed* player = FindPlayerPed(0);
         CVector origin = player ? player->GetPosition() : CVector(0, 0, 0);
@@ -591,28 +597,11 @@ static void pipeThread() {
         char chunk[4096];
         while (g_running) {
             DWORD avail = 0;
-            if (!PeekNamedPipe(g_pipe, nullptr, 0, nullptr, &avail, nullptr) || (avail == 0 && !g_running)) {
-                // check if write side pending from game thread
-                {
-                    std::lock_guard<std::mutex> lk(g_mutex);
-                    while (!g_respQueue.empty()) {
-                        std::string line = g_respQueue.front().line + "\n";
-                        g_respQueue.pop_front();
-                        DWORD w;
-                        WriteFile(g_pipe, line.c_str(), (DWORD)line.size(), &w, nullptr);
-                    }
-                }
-                Sleep(8); // ~120Hz polling
-                continue;
-            }
+            if (!PeekNamedPipe(g_pipe, nullptr, 0, nullptr, &avail, nullptr))
+                break; // client gone or pipe broken — reconnect
 
-            DWORD read = 0;
-            DWORD toRead = std::min(avail, (DWORD)sizeof(chunk));
-            if (!ReadFile(g_pipe, chunk, toRead, &read, nullptr) || read == 0) break;
-
-            buf.append(chunk, read);
-
-            // Flush any pending responses
+            // Flush pending responses every iteration so replies are never
+            // stuck waiting for the next incoming message.
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
                 while (!g_respQueue.empty()) {
@@ -622,6 +611,14 @@ static void pipeThread() {
                     WriteFile(g_pipe, line.c_str(), (DWORD)line.size(), &w, nullptr);
                 }
             }
+
+            if (avail == 0) { Sleep(8); continue; } // idle — keep connection alive
+
+            DWORD read = 0;
+            DWORD toRead = std::min(avail, (DWORD)sizeof(chunk));
+            if (!ReadFile(g_pipe, chunk, toRead, &read, nullptr) || read == 0) break;
+
+            buf.append(chunk, read);
 
             // Dispatch complete lines as commands
             size_t pos;
