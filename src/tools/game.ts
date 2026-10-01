@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as proc from "../process.ts";
-import { isConnected, ensureConnected, disconnect, send } from "../pipe.ts";
+import { isConnected, ensureConnected, disconnect, send, getCachedGameState } from "../pipe.ts";
 import type { Config } from "../config.ts";
 
 export function registerGameTools(server: McpServer, cfg: Config) {
@@ -25,7 +25,7 @@ export function registerGameTools(server: McpServer, cfg: Config) {
 
   server.tool(
     "game_status",
-    "Check if GTA SA is running and whether the debug bridge is connected.",
+    "Check if GTA SA is running, whether the debug bridge is connected, and the current scene (from the 100ms state cache).",
     {},
     async () => {
       const running = await proc.isGameRunning();
@@ -35,10 +35,11 @@ export function registerGameTools(server: McpServer, cfg: Config) {
       } else {
         bridgeConnected = isConnected();
       }
+      const state = bridgeConnected ? getCachedGameState() : null;
       return {
         content: [{
           type: "text",
-          text: JSON.stringify({ running, bridgeConnected }, null, 2),
+          text: JSON.stringify({ running, bridgeConnected, state }, null, 2),
         }],
       };
     }
@@ -46,9 +47,13 @@ export function registerGameTools(server: McpServer, cfg: Config) {
 
   server.tool(
     "game_state",
-    "Detect the game's current scene: loading (splash/intro), menu, paused, or in_game. Works even before gameplay starts — use it to know whether gameplay commands can run.",
+    "Detect the game's current scene: loading (splash/intro), menu, paused, cutscene, or in_game. Served from the 100ms state cache when fresh — use it to know whether gameplay commands can run.",
     {},
     async () => {
+      const cached = getCachedGameState();
+      if (cached) {
+        return { content: [{ type: "text", text: JSON.stringify({ ...cached, cached: true }, null, 2) }] };
+      }
       if (!isConnected()) {
         try { await ensureConnected(2000); } catch {
           return { content: [{ type: "text", text: "Bridge not connected." }] };

@@ -44,11 +44,15 @@
 #include <CTaskSimpleStandStill.h>
 #include <CTaskComplexDie.h>
 #include <CMenuManager.h>
+#include <CCutsceneMgr.h>
+#include <CRadar.h>
 #include <extensions/PoolIterator.h>
+#include <extensions/ScriptCommands.h>
 #include <CWeaponInfo.h>
 #include <enums/eWeaponType.h>
 #include <enums/eTaskType.h>
 #include <enums/eAnimations.h>
+#include <enums/eScriptCommands.h>
 
 #include <windows.h>
 #include <string>
@@ -63,6 +67,18 @@
 
 struct PendingKey { int vk; int framesLeft; };
 static std::vector<PendingKey> g_pendingKeys;
+
+// ---- fast-boot -------------------------------------------------------------
+// When the MCP sentinel is present, start a new game automatically (skipping
+// splash screens and menu) and skip the intro cutscene, so the agent lands
+// straight in controllable gameplay.
+
+static bool g_fastboot = false;
+static int  g_fastbootTimer = 0;
+
+// Commands queued while the player is not active (loading/menu/cutscene) are
+// dropped with an error after this long, so the MCP client never hangs.
+static const ULONGLONG kQueueTtlMs = 15000;
 
 // ---- simple JSON builder ------------------------------------------------
 
@@ -130,7 +146,7 @@ static bool jsonGetBool(const std::string& json, const std::string& key, bool de
 
 // ---- command queue -------------------------------------------------------
 
-struct BridgeCommand { int id; std::string cmd; std::string json; };
+struct BridgeCommand { int id; std::string cmd; std::string json; ULONGLONG receivedAtMs; };
 struct Response { std::string line; };
 
 static std::deque<BridgeCommand>  g_cmdQueue;
@@ -233,11 +249,13 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
     // ---- player_enter_vehicle ----
     if (cmd == "player_enter_vehicle") {
         CPlayerPed* player = FindPlayerPed(0);
-        if (!player || !player->m_pIntelligence) return "null";
+        if (!player) return "null";
         CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
         if (!veh) return "null";
-        CTask* t = new CTaskComplexEnterCarAsDriver(veh);
-        player->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
+        // Route through the game's own SCM opcode handler (COMMAND_TASK_ENTER_CAR_AS_DRIVER)
+        // — the exact path main.scm uses for CJ. Manually constructing
+        // CTaskComplexEnterCarAsDriver here crashed with R6025 (pure virtual call).
+        plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_ENTER_CAR_AS_DRIVER, player, veh);
         return "{}";
     }
 
@@ -523,8 +541,9 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         } else if (task == "enter_vehicle" && jsonHasKey(json, "vehicleHandle")) {
             CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
             if (!veh) return "null";
-            t = new CTaskComplexEnterCarAsDriver(veh);
-            ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
+            // Same SCM opcode path as player_enter_vehicle — manual CTask
+            // construction crashes with R6025 (pure virtual call).
+            plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_ENTER_CAR_AS_DRIVER, ped, veh);
         } else if (task == "play_anim") {
             std::string animName = jsonGetStr(json, "animName");
             std::string animLib  = jsonGetStr(json, "animLib", "ped");
@@ -592,6 +611,33 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         keybd_event((BYTE)vk, 0, 0, 0);
         g_pendingKeys.push_back({ vk, frames });
         return "{}";
+    }
+
+    // ---- radar_blips ----
+    if (cmd == "radar_blips") {
+        if (!CRadar::ms_RadarTrace) return "null";
+        std::ostringstream o;
+        o << "{\"blips\":[";
+        bool first = true;
+        for (unsigned int i = 0; i < MAX_RADAR_TRACES; i++) {
+            const tRadarTrace& b = CRadar::ms_RadarTrace[i];
+            if (!b.m_bInUse) continue;
+            if (!first) o << ",";
+            o << "{\"index\":" << i
+              << ",\"type\":" << (int)b.m_nBlipType
+              << ",\"x\":" << fmtf(b.m_vecPos.x)
+              << ",\"y\":" << fmtf(b.m_vecPos.y)
+              << ",\"z\":" << fmtf(b.m_vecPos.z)
+              << ",\"colour\":" << b.m_nColour
+              << ",\"sprite\":" << (int)b.m_nRadarSprite
+              << ",\"size\":" << (int)b.m_nBlipSize
+              << ",\"shortRange\":" << (b.m_bShortRange ? "true" : "false")
+              << ",\"entityHandle\":" << b.m_nEntityHandle
+              << "}";
+            first = false;
+        }
+        o << "]}";
+        return o.str();
     }
 
     // ---- world_pool_dump ----
@@ -780,28 +826,29 @@ static void pipeThread() {
                 // even during splash, menu, pause, or loading.
                 bool menuActive = FrontEndMenuManager.m_bMenuActive;
                 bool playerReady = CWorld::Players[0].m_pPed != nullptr;
+                bool cutsceneActive = playerReady &&
+                    (CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing);
                 const char* scene = menuActive ? (playerReady ? "paused" : "menu")
-                                               : (playerReady ? "in_game" : "loading");
+                                   : !playerReady ? "loading"
+                                   : cutsceneActive ? "cutscene"
+                                   : "in_game";
 
                 if (cmd == "game_state") {
                     // Answered here so scene queries work before gameplay starts.
                     std::ostringstream o;
                     o << "{\"id\":" << id << ",\"ok\":true,\"data\":{\"scene\":\"" << scene
                       << "\",\"menuVisible\":" << (menuActive ? "true" : "false")
-                      << ",\"playerReady\":" << (playerReady ? "true" : "false") << "}}";
-                    std::lock_guard<std::mutex> lk(g_mutex);
-                    g_respQueue.push_back({ o.str() });
-                } else if (std::string(scene) != "in_game") {
-                    // Don't queue gameplay commands while not in gameplay — they'd
-                    // either hang until timeout or execute stale after loading.
-                    std::ostringstream o;
-                    o << "{\"id\":" << id << ",\"ok\":false,\"error\":\"game not in gameplay (scene: "
-                      << scene << ")\"}";
+                      << ",\"playerReady\":" << (playerReady ? "true" : "false")
+                      << ",\"cutsceneActive\":" << (cutsceneActive ? "true" : "false") << "}}";
                     std::lock_guard<std::mutex> lk(g_mutex);
                     g_respQueue.push_back({ o.str() });
                 } else {
+                    // Queue gameplay commands until the player is active again
+                    // (loading, menu, pause, cutscene). The game thread drains
+                    // the queue once the scene is in_game, or expires it after
+                    // kQueueTtlMs so the client never hangs.
                     std::lock_guard<std::mutex> lk(g_mutex);
-                    g_cmdQueue.push_back({ id, cmd, line });
+                    g_cmdQueue.push_back({ id, cmd, line, GetTickCount64() });
                 }
             }
         }
@@ -842,9 +889,34 @@ public:
             return; // not in MCP debug mode — zero overhead
 
         g_running = true;
+        g_fastboot = true; // auto-start a new game and skip the intro cutscene
         std::thread(pipeThread).detach();
 
         Events::gameProcessEvent += [] {
+            // ---- fast-boot: auto-start new game + skip intro cutscene ----
+            if (g_fastboot) {
+                bool menuActive = FrontEndMenuManager.m_bMenuActive;
+                bool playerReady = CWorld::Players[0].m_pPed != nullptr;
+                bool cutsceneActive = CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing;
+
+                if (menuActive && !playerReady) {
+                    // Frontend (splash or menu) still up — trigger a new game
+                    // directly, same path the "New Game" button uses.
+                    if (++g_fastbootTimer >= 20) {
+                        g_fastbootTimer = 0;
+                        FrontEndMenuManager.DoSettingsBeforeStartingAGame();
+                    }
+                } else if (!menuActive && playerReady && cutsceneActive) {
+                    // Intro cutscene — flag it skipped every few frames until done.
+                    if (++g_fastbootTimer >= 5) {
+                        g_fastbootTimer = 0;
+                        CCutsceneMgr::ms_wasCutsceneSkipped = true;
+                    }
+                } else if (!menuActive && playerReady && !cutsceneActive) {
+                    g_fastboot = false; // controllable gameplay reached
+                }
+            }
+
             // Release injected keys after their frame count expires
             for (auto it = g_pendingKeys.begin(); it != g_pendingKeys.end();) {
                 if (--it->framesLeft <= 0) {
@@ -856,6 +928,22 @@ public:
             }
 
             std::lock_guard<std::mutex> lk(g_mutex);
+
+            // Expire stale queued commands so clients never hang waiting.
+            ULONGLONG nowMs = GetTickCount64();
+            while (!g_cmdQueue.empty() && nowMs - g_cmdQueue.front().receivedAtMs > kQueueTtlMs) {
+                BridgeCommand c = g_cmdQueue.front();
+                g_cmdQueue.pop_front();
+                g_respQueue.push_back({ "{\"id\":" + std::to_string(c.id) +
+                    ",\"ok\":false,\"error\":\"queued command expired waiting for gameplay (15s)\"}" });
+            }
+
+            // Only execute queued commands while the player is actually active.
+            bool playerReady = CWorld::Players[0].m_pPed != nullptr;
+            bool cutsceneActive = CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing;
+            if (!playerReady || cutsceneActive || FrontEndMenuManager.m_bMenuActive)
+                return;
+
             while (!g_cmdQueue.empty()) {
                 BridgeCommand c = g_cmdQueue.front();
                 g_cmdQueue.pop_front();

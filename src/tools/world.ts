@@ -76,4 +76,14 @@ export function registerWorldTools(server: McpServer) {
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
+
+  server.tool(
+    "radar_get_blips",
+    "List all active radar blips (waypoints, mission markers, entity blips) with position, colour, sprite, and attached entity handle.",
+    {},
+    async () => {
+      const data = await send("radar_blips");
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
 }

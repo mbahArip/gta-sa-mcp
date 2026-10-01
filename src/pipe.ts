@@ -9,7 +9,9 @@
 import { connect } from "node:net";
 
 const PIPE_NAME = "\\\\.\\pipe\\gtasa_mcp_bridge";
-const DEFAULT_TIMEOUT = 5000;
+// Queued gameplay commands may legitimately wait up to the bridge's 15s queue
+// TTL (loading screens, cutscenes) — give them headroom.
+const DEFAULT_TIMEOUT = 20000;
 
 let _idCounter = 1;
 const _pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -83,6 +85,40 @@ export function disconnect() {
   _socket?.destroy();
   _socket = null;
   _connectPromise = null;
+}
+
+// ---- background game-state cache ------------------------------------------
+// Polled every 100ms while connected so status reads are instant and stale
+// connections are noticed proactively. Poll failures simply invalidate the
+// cache (null = no fresh data) — no data is invented on failure.
+
+interface GameStateData {
+  scene: string;
+  menuVisible: boolean;
+  playerReady: boolean;
+  cutsceneActive?: boolean;
+}
+
+let _cachedState: { data: GameStateData; at: number } | null = null;
+
+// Fire-and-forget by design: a failed poll means "no fresh state", represented
+// by the cache being null — errors are intentionally not propagated.
+const _statePollTimer = setInterval(() => {
+  if (!isConnected()) {
+    _cachedState = null;
+    return;
+  }
+  send<GameStateData>("game_state", {}, 2000)
+    .then((data) => { _cachedState = { data, at: Date.now() }; })
+    .catch(() => { _cachedState = null; });
+}, 100);
+if (typeof _statePollTimer.unref === "function") _statePollTimer.unref();
+
+export function getCachedGameState(maxAgeMs = 1000): (GameStateData & { ageMs: number }) | null {
+  if (!_cachedState) return null;
+  const ageMs = Date.now() - _cachedState.at;
+  if (ageMs > maxAgeMs) return null;
+  return { ..._cachedState.data, ageMs };
 }
 
 export async function send<T = unknown>(
