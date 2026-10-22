@@ -32,3 +32,24 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# MSVC build artifacts - build output is published as a GitHub Release asset
+*.obj
+*.pdb
+*.map
+*.tlog
+*.lastbuildstate
+*.recipe
+*.unsuccessfulbuild
+*.ilk
+*.exp
+*.lib
+*.idb
+*.iobj
+*.ipdb
+*.asi
+*.dll
+.vs/
+bridge/Release/
+bridge/Debug/
+bridge/debug_bridge/

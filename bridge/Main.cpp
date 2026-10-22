@@ -31,14 +31,24 @@
 #include <CTrailer.h>
 #include <CTrain.h>
 #include <CCivilianPed.h>
+#include <CObject.h>
+#include <CPickups.h>
+#include <CFireManager.h>
+#include <CAudioEngine.h>
+#include <CCheat.h>
+#include <CStats.h>
+#include <CCamera.h>
 #include <CStreaming.h>
 #include <CModelInfo.h>
 #include <CTheScripts.h>
+#include <CRunningScript.h>
 #include <CWanted.h>
 #include <CTaskComplexWanderStandard.h>
 #include <CTaskComplexKillPedOnFoot.h>
 #include <CTaskComplexEnterCarAsDriver.h>
 #include <CTaskSimpleRunNamedAnim.h>
+#include <CTaskSimpleDuck.h>
+#include <CTaskSimpleJetPack.h>
 #include <CExplosion.h>
 #include <CWeather.h>
 #include <CTaskSimpleStandStill.h>
@@ -53,6 +63,10 @@
 #include <enums/eTaskType.h>
 #include <enums/eAnimations.h>
 #include <enums/eScriptCommands.h>
+#include <enums/eStats.h>
+#include <enums/eRadioID.h>
+#include <enums/eCamMode.h>
+#include <Patch.h>
 
 #include <windows.h>
 #include <string>
@@ -62,6 +76,32 @@
 #include <thread>
 #include <sstream>
 #include <iomanip>
+#include <cstdio>
+#include <cstdarg>
+#include <algorithm>
+
+static void BridgeLog(const char* fmt, ...) {
+    static FILE* f = nullptr;
+    if (!f) {
+        char dir[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, dir, MAX_PATH);
+        char* slash = strrchr(dir, '\\');
+        if (slash) *slash = '\0';
+        char path[MAX_PATH] = {};
+        snprintf(path, sizeof(path), "%s\\debug_bridge.log", dir);
+        f = fopen(path, "w");
+        if (!f) return;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
 
 // ---- injected-key state (processed per frame on the game thread) ----------
 
@@ -69,15 +109,8 @@ struct PendingKey { int vk; int framesLeft; };
 static std::vector<PendingKey> g_pendingKeys;
 
 // ---- fast-boot -------------------------------------------------------------
-// When the MCP sentinel is present, start a new game automatically (skipping
-// splash screens and menu) and skip the intro cutscene, so the agent lands
-// straight in controllable gameplay.
-
 static bool g_fastboot = false;
 static int  g_fastbootTimer = 0;
-
-// Commands queued while the player is not active (loading/menu/cutscene) are
-// dropped with an error after this long, so the MCP client never hangs.
 static const ULONGLONG kQueueTtlMs = 15000;
 
 // ---- simple JSON builder ------------------------------------------------
@@ -97,10 +130,7 @@ static std::string fmtf(float v) {
     char buf[32]; sprintf_s(buf, "%.4f", v); return buf;
 }
 
-// ---- minimal JSON parser (only what we need) ----------------------------
-// Parses flat {"key":value} — no nesting, no arrays. Sufficient for our protocol.
-
-struct JVal { std::string s; double n = 0; bool isNum = false; bool isNull = true; };
+// ---- minimal JSON parser ------------------------------------------------
 
 static std::string jsonGetStr(const std::string& json, const std::string& key, const std::string& def = "") {
     std::string search = "\"" + key + "\"";
@@ -149,15 +179,13 @@ static bool jsonGetBool(const std::string& json, const std::string& key, bool de
 struct BridgeCommand { int id; std::string cmd; std::string json; ULONGLONG receivedAtMs; };
 struct Response { std::string line; };
 
-static std::deque<BridgeCommand>  g_cmdQueue;
-static std::deque<Response> g_respQueue;
-static std::mutex           g_mutex;
+static std::deque<BridgeCommand> g_cmdQueue;
+static std::deque<Response>      g_respQueue;
+static std::mutex                g_mutex;
 
-// ---- ped/vehicle handle map ---------------------------------------------
-// SCM-style refs (slot index << 8 | generation) so stale handles to recycled
-// pool slots resolve to nullptr instead of silently hitting the wrong entity.
+// ---- handle maps (ped, vehicle, object) ----------------------------------
 
-static CPed*    HandleToPed(int handle) {
+static CPed* HandleToPed(int handle) {
     if (!CPools::ms_pPedPool) return nullptr;
     return CPools::ms_pPedPool->GetAtRef(handle);
 }
@@ -165,17 +193,73 @@ static CVehicle* HandleToVehicle(int handle) {
     if (!CPools::ms_pVehiclePool) return nullptr;
     return CPools::ms_pVehiclePool->GetAtRef(handle);
 }
+static CObject* HandleToObject(int handle) {
+    if (!CPools::ms_pObjectPool) return nullptr;
+    return CPools::ms_pObjectPool->GetAtRef(handle);
+}
 static int PedToHandle(CPed* ped) {
     return CPools::ms_pPedPool ? CPools::ms_pPedPool->GetRef(ped) : -1;
 }
 static int VehicleToHandle(CVehicle* veh) {
     return CPools::ms_pVehiclePool ? CPools::ms_pVehiclePool->GetRef(veh) : -1;
 }
+static int ObjectToHandle(CObject* obj) {
+    return CPools::ms_pObjectPool ? CPools::ms_pObjectPool->GetRef(obj) : -1;
+}
+
+// ---- dynamic SCM byte emitter -------------------------------------------
+
+struct DynScriptCode {
+    unsigned char data[512];
+    unsigned int size;
+
+    DynScriptCode(short commandId) : size(0) {
+        memcpy(&data[size], &commandId, 2);
+        size += 2;
+    }
+
+    void AddInt(int val) {
+        data[size++] = (unsigned char)SCRIPTPARAM_STATIC_INT_32BITS;
+        memcpy(&data[size], &val, 4);
+        size += 4;
+    }
+
+    void AddFloat(float val) {
+        data[size++] = (unsigned char)SCRIPTPARAM_STATIC_FLOAT;
+        memcpy(&data[size], &val, 4);
+        size += 4;
+    }
+
+    void AddString(const char* str) {
+        data[size++] = (unsigned char)SCRIPTPARAM_STATIC_PASCAL_STRING;
+        unsigned int len = (unsigned int)strlen(str);
+        data[size++] = (unsigned char)len;
+        memcpy(&data[size], str, len);
+        size += len;
+    }
+
+    void AddPed(CPed* ped) {
+        int handle = CPools::ms_pPedPool ? CPools::ms_pPedPool->GetRef(ped) : 0;
+        AddInt(handle);
+    }
+
+    void AddVehicle(CVehicle* veh) {
+        int handle = CPools::ms_pVehiclePool ? CPools::ms_pVehiclePool->GetRef(veh) : 0;
+        AddInt(handle);
+    }
+
+    void AddObject(CObject* obj) {
+        int handle = CPools::ms_pObjectPool ? CPools::ms_pObjectPool->GetRef(obj) : 0;
+        AddInt(handle);
+    }
+};
 
 // ---- command handlers (run on game thread via gameProcessEvent) ----------
 
 static std::string handleCommand(const std::string& cmd, const std::string& json) {
-    // ---- player_get ----
+    // ==========================================
+    // PLAYER
+    // ==========================================
     if (cmd == "player_get") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
@@ -189,6 +273,7 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
           << "\"heading\":" << fmtf(player->GetHeading() * 57.2957795f) << ","
           << "\"health\":" << fmtf(player->m_fHealth) << ","
           << "\"armour\":" << fmtf(player->m_fArmour) << ","
+          << "\"maxHealth\":" << fmtf(player->m_fMaxHealth) << ","
           << "\"wanted\":" << (player->m_pPlayerData && player->m_pPlayerData->m_pWanted ? (int)player->m_pPlayerData->m_pWanted->m_nWantedLevel : 0) << ","
           << "\"money\":" << CWorld::Players[0].m_nMoney << ","
           << "\"interior\":" << (int)player->m_nAreaCode << ","
@@ -198,21 +283,24 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- player_set ----
     if (cmd == "player_set") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
         if (jsonHasKey(json, "health")) player->m_fHealth = (float)jsonGetNum(json, "health");
+        if (jsonHasKey(json, "maxHealth")) player->m_fMaxHealth = (float)jsonGetNum(json, "maxHealth");
         if (jsonHasKey(json, "armour")) player->m_fArmour = (float)jsonGetNum(json, "armour");
         if (jsonHasKey(json, "money"))  CWorld::Players[0].m_nMoney = (int)jsonGetNum(json, "money");
         if (jsonHasKey(json, "wanted") && player->m_pPlayerData && player->m_pPlayerData->m_pWanted) {
             int w = (int)jsonGetNum(json, "wanted");
             player->m_pPlayerData->m_pWanted->SetWantedLevel(w);
         }
+        if (jsonHasKey(json, "invincible")) {
+            bool inv = jsonGetBool(json, "invincible");
+            player->bInvulnerable = inv;
+        }
         return "{}";
     }
 
-    // ---- player_teleport ----
     if (cmd == "player_teleport") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
@@ -220,7 +308,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         float y = (float)jsonGetNum(json, "y");
         float z = (float)jsonGetNum(json, "z");
         CVector pos = { x, y, z };
-        // Remove from vehicle first
         if (player->bInVehicle && player->m_pVehicle) {
             player->m_pVehicle->RemoveDriver(false);
             player->bInVehicle = false;
@@ -233,33 +320,82 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- player_give_weapon ----
     if (cmd == "player_give_weapon") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
         int wt = (int)jsonGetNum(json, "weaponType");
-        int ammo = (int)jsonGetNum(json, "ammo");
+        int ammo = (int)jsonGetNum(json, "ammo", 100);
         bool setActive = jsonGetBool(json, "setActive", true);
-        // GiveWeapon handles model loading internally — just mark deletable after
+        CWeaponInfo* wi = CWeaponInfo::GetWeaponInfo((eWeaponType)wt);
+        if (wi && wi->m_nModelId > 0) {
+            CStreaming::RequestModel(wi->m_nModelId, GAME_REQUIRED);
+            CStreaming::LoadAllRequestedModels(false);
+            CStreaming::SetModelIsDeletable(wi->m_nModelId);
+        }
         player->GiveWeapon((eWeaponType)wt, ammo, true);
         if (setActive) player->SetCurrentWeapon((eWeaponType)wt);
         return "{}";
     }
 
-    // ---- player_enter_vehicle ----
+    if (cmd == "player_remove_weapon") {
+        CPlayerPed* player = FindPlayerPed(0);
+        if (!player) return "null";
+        int wt = (int)jsonGetNum(json, "weaponType");
+        player->ClearWeapon((eWeaponType)wt);
+        return "{}";
+    }
+
+    if (cmd == "player_clear_weapons") {
+        CPlayerPed* player = FindPlayerPed(0);
+        if (!player) return "null";
+        player->ClearWeapons();
+        return "{}";
+    }
+
+    if (cmd == "player_set_skin") {
+        CPlayerPed* player = FindPlayerPed(0);
+        if (!player) return "null";
+        int modelId = (int)jsonGetNum(json, "modelId");
+        CStreaming::RequestModel(modelId, GAME_REQUIRED);
+        CStreaming::LoadAllRequestedModels(false);
+        if (!CStreaming::HasModelLoaded(modelId)) return "{\"error\":\"model failed to load\"}";
+        player->SetModelIndex(modelId);
+        CStreaming::SetModelIsDeletable(modelId);
+        return "{}";
+    }
+
+    if (cmd == "player_set_stat") {
+        int statId = (int)jsonGetNum(json, "statId");
+        float val = (float)jsonGetNum(json, "value");
+        CStats::SetStatValue((unsigned short)statId, val);
+        return "{}";
+    }
+
+    if (cmd == "player_get_stat") {
+        int statId = (int)jsonGetNum(json, "statId");
+        float val = CStats::GetStatValue((unsigned short)statId);
+        return "{\"statId\":" + std::to_string(statId) + ",\"value\":" + fmtf(val) + "}";
+    }
+
+    if (cmd == "player_clear_wanted") {
+        CPlayerPed* player = FindPlayerPed(0);
+        if (!player || !player->m_pPlayerData || !player->m_pPlayerData->m_pWanted) return "null";
+        player->m_pPlayerData->m_pWanted->SetWantedLevel(0);
+        return "{}";
+    }
+
     if (cmd == "player_enter_vehicle") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
         CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
         if (!veh) return "null";
-        // Route through the game's own SCM opcode handler (COMMAND_TASK_ENTER_CAR_AS_DRIVER)
-        // — the exact path main.scm uses for CJ. Manually constructing
-        // CTaskComplexEnterCarAsDriver here crashed with R6025 (pure virtual call).
         plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_ENTER_CAR_AS_DRIVER, player, veh);
         return "{}";
     }
 
-    // ---- vehicle_spawn ----
+    // ==========================================
+    // VEHICLE
+    // ==========================================
     if (cmd == "vehicle_spawn") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
@@ -272,8 +408,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         CStreaming::LoadAllRequestedModels(false);
         if (CStreaming::ms_aInfoForModel[modelId].m_nLoadState != LOADSTATE_LOADED)
             return "null";
-        // Restore deletable state before touching the model — the spawned vehicle
-        // holds its own reference, so streaming won't evict a model in use.
         if (!(oldFlags & GAME_REQUIRED)) {
             CStreaming::SetModelIsDeletable(modelId);
             CStreaming::SetModelTxdIsDeletable(modelId);
@@ -307,7 +441,7 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
 
         pos.z += veh->GetHeightAboveRoad();
         veh->SetOrientation(0.f, 0.f, heading);
-        veh->Teleport(pos);  // calls CWorld::Add internally
+        veh->Teleport(pos);
         veh->m_nStatus = eEntityStatus::STATUS_ABANDONED;
         veh->bEngineOn = false;
         veh->m_eDoorLock = DOORLOCK_UNLOCKED;
@@ -332,7 +466,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- vehicle_get ----
     if (cmd == "vehicle_get") {
         CVehicle* veh = jsonHasKey(json, "handle")
             ? HandleToVehicle((int)jsonGetNum(json, "handle"))
@@ -346,13 +479,14 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
           << "\"speed\":" << fmtf(veh->m_vecMoveSpeed.Magnitude() * 50.0f) << ","
           << "\"gear\":" << (int)veh->m_nCurrentGear << ","
           << "\"doorLock\":" << (int)veh->m_eDoorLock << ","
+          << "\"primaryColor\":" << (int)veh->m_nPrimaryColor << ","
+          << "\"secondaryColor\":" << (int)veh->m_nSecondaryColor << ","
           << "\"engineOn\":" << (veh->bEngineOn ? "true" : "false") << ","
           << "\"driverHandle\":" << (veh->m_pDriver ? PedToHandle(veh->m_pDriver) : -1)
           << "}";
         return o.str();
     }
 
-    // ---- vehicle_set ----
     if (cmd == "vehicle_set") {
         CVehicle* veh = jsonHasKey(json, "handle")
             ? HandleToVehicle((int)jsonGetNum(json, "handle"))
@@ -361,10 +495,57 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         if (jsonHasKey(json, "health"))   veh->m_fHealth = (float)jsonGetNum(json, "health");
         if (jsonHasKey(json, "doorLock")) veh->m_eDoorLock = (eDoorLock)(int)jsonGetNum(json, "doorLock");
         if (jsonHasKey(json, "engine"))   veh->bEngineOn = jsonGetBool(json, "engine");
+        if (jsonHasKey(json, "dirtLevel")) veh->m_fDirtLevel = (float)jsonGetNum(json, "dirtLevel");
+        if (jsonHasKey(json, "alarm")) veh->m_nAlarmState = (unsigned short)jsonGetNum(json, "alarm");
         return "{}";
     }
 
-    // ---- vehicle_remove ----
+    if (cmd == "vehicle_set_color") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        int col1 = (int)jsonGetNum(json, "primaryColor");
+        int col2 = (int)jsonGetNum(json, "secondaryColor", col1);
+        veh->m_nPrimaryColor = (unsigned char)col1;
+        veh->m_nSecondaryColor = (unsigned char)col2;
+        return "{}";
+    }
+
+    if (cmd == "vehicle_tune") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        int modId = (int)jsonGetNum(json, "upgradeModelId");
+        CStreaming::RequestModel(modId, GAME_REQUIRED);
+        CStreaming::LoadAllRequestedModels(false);
+        plugin::scripting::CallCommandById((unsigned int)COMMAND_ADD_VEHICLE_MOD, veh, modId);
+        CStreaming::SetModelIsDeletable(modId);
+        return "{}";
+    }
+
+    if (cmd == "vehicle_pop_tire") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        int tire = (int)jsonGetNum(json, "tireIndex", 0);
+        veh->BurstTyre((unsigned char)tire, true);
+        return "{}";
+    }
+
+    if (cmd == "vehicle_set_door_state") {
+        CVehicle* veh = jsonHasKey(json, "handle")
+            ? HandleToVehicle((int)jsonGetNum(json, "handle"))
+            : FindPlayerVehicle(0, false);
+        if (!veh) return "null";
+        int doorId = (int)jsonGetNum(json, "doorId");
+        float ratio = (float)jsonGetNum(json, "ratio", 1.0f);
+        veh->OpenDoor(nullptr, doorId, (eDoors)doorId, ratio, true);
+        return "{}";
+    }
+
     if (cmd == "vehicle_remove") {
         CVehicle* veh = jsonHasKey(json, "handle")
             ? HandleToVehicle((int)jsonGetNum(json, "handle"))
@@ -376,7 +557,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- vehicle_teleport ----
     if (cmd == "vehicle_teleport") {
         CVehicle* veh = jsonHasKey(json, "handle")
             ? HandleToVehicle((int)jsonGetNum(json, "handle"))
@@ -388,19 +568,21 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- vehicle_fix ----
     if (cmd == "vehicle_fix") {
         CVehicle* veh = jsonHasKey(json, "handle")
             ? HandleToVehicle((int)jsonGetNum(json, "handle"))
             : FindPlayerVehicle(0, false);
         if (!veh) return "null";
         veh->m_fHealth = 1000.0f;
-        veh->SetOrientation(0.0f, 0.0f, veh->GetHeading()); // un-flip
+        veh->SetOrientation(0.0f, 0.0f, veh->GetHeading());
         veh->UpdateRwMatrix();
+        veh->Fix();
         return "{}";
     }
 
-    // ---- ped_spawn ----
+    // ==========================================
+    // PED
+    // ==========================================
     if (cmd == "ped_spawn") {
         CPlayerPed* player = FindPlayerPed(0);
         if (!player) return "null";
@@ -440,7 +622,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- ped_get ----
     if (cmd == "ped_get") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped) return "null";
@@ -458,7 +639,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- ped_set ----
     if (cmd == "ped_set") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped) return "null";
@@ -467,7 +647,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- ped_remove ----
     if (cmd == "ped_remove") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped) return "null";
@@ -477,7 +656,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- ped_teleport ----
     if (cmd == "ped_teleport") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped) return "null";
@@ -486,7 +664,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- ped_give_weapon ----
     if (cmd == "ped_give_weapon") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped) return "null";
@@ -494,8 +671,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         int ammo = (int)jsonGetNum(json, "ammo", 100);
         bool setActive = jsonGetBool(json, "setActive", true);
 
-        // Resolve the weapon's model via weapon info and stream it in first —
-        // GiveWeapon does not load models itself.
         CWeaponInfo* wi = CWeaponInfo::GetWeaponInfo((eWeaponType)wt);
         if (!wi || wi->m_nModelId <= 0) return "{\"error\":\"invalid weaponType\"}";
         int modelId = wi->m_nModelId;
@@ -514,7 +689,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- ped_set_task ----
     if (cmd == "ped_set_task") {
         CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
         if (!ped || !ped->m_pIntelligence) return "null";
@@ -526,7 +700,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
             t = new CTaskComplexWanderStandard(PEDMOVE_WALK, 0, true);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
         } else if (task == "follow_player" && player) {
-            // CTaskComplexFollowPedFootstep not in SDK — wander fast toward player area
             t = new CTaskComplexWanderStandard(PEDMOVE_RUN, 0, true);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_DEFAULT, true);
         } else if (task == "attack_player" && player) {
@@ -541,9 +714,23 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         } else if (task == "enter_vehicle" && jsonHasKey(json, "vehicleHandle")) {
             CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
             if (!veh) return "null";
-            // Same SCM opcode path as player_enter_vehicle — manual CTask
-            // construction crashes with R6025 (pure virtual call).
             plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_ENTER_CAR_AS_DRIVER, ped, veh);
+        } else if (task == "leave_vehicle") {
+            CVehicle* veh = FindPlayerVehicle(0, false);
+            if (veh) plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_LEAVE_ANY_CAR, ped);
+        } else if (task == "drive_to") {
+            float tx = (float)jsonGetNum(json, "x");
+            float ty = (float)jsonGetNum(json, "y");
+            float tz = (float)jsonGetNum(json, "z");
+            float spd = (float)jsonGetNum(json, "speed", 20.0);
+            CVehicle* veh = FindPlayerVehicle(0, false);
+            if (veh) plugin::scripting::CallCommandById((unsigned int)COMMAND_TASK_CAR_DRIVE_TO_COORD, ped, veh, tx, ty, tz, spd, 0, 0, 0);
+        } else if (task == "duck") {
+            t = new CTaskSimpleDuck(DUCK_STANDALONE, 10000);
+            ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
+        } else if (task == "jetpack") {
+            t = new CTaskSimpleJetPack();
+            ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
         } else if (task == "play_anim") {
             std::string animName = jsonGetStr(json, "animName");
             std::string animLib  = jsonGetStr(json, "animLib", "ped");
@@ -555,12 +742,121 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
             t = new CTaskComplexDie(WEAPONTYPE_UNARMED, 0, ANIM_DEFAULT_KO_SKID_FRONT, 4.0f, 1.0f, false, false, 0, false);
             ped->m_pIntelligence->m_TaskMgr.SetTask(t, TASK_PRIMARY_PRIMARY, true);
         } else {
-            return "{\"error\":\"unknown task or missing player\"}";
+            return "{\"error\":\"unknown task or missing parameters\"}";
         }
         return "{}";
     }
 
-    // ---- world_set_time ----
+    if (cmd == "ped_clear_tasks") {
+        CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
+        if (!ped || !ped->m_pIntelligence) return "null";
+        ped->m_pIntelligence->m_TaskMgr.ClearTaskEventResponse();
+        plugin::scripting::CallCommandById((unsigned int)COMMAND_CLEAR_CHAR_TASKS, ped);
+        return "{}";
+    }
+
+    if (cmd == "ped_resurrect") {
+        CPed* ped = HandleToPed((int)jsonGetNum(json, "handle"));
+        if (!ped) return "null";
+        ped->m_fHealth = 100.0f;
+        ped->SetPedState(PEDSTATE_IDLE);
+        return "{}";
+    }
+
+    // ==========================================
+    // CAMERA
+    // ==========================================
+    if (cmd == "camera_get") {
+        CVector pos = TheCamera.GetPosition();
+        CVector front = TheCamera.m_vecGameCamPos;
+        std::ostringstream o;
+        o << "{"
+          << "\"x\":" << fmtf(pos.x) << ","
+          << "\"y\":" << fmtf(pos.y) << ","
+          << "\"z\":" << fmtf(pos.z) << ","
+          << "\"frontX\":" << fmtf(front.x) << ","
+          << "\"frontY\":" << fmtf(front.y) << ","
+          << "\"frontZ\":" << fmtf(front.z) << ","
+          << "\"fov\":" << fmtf(TheCamera.FindCamFOV()) << ","
+          << "\"activeCam\":" << (int)TheCamera.m_nActiveCam
+          << "}";
+        return o.str();
+    }
+
+    if (cmd == "camera_set_pos") {
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+        plugin::scripting::CallCommandById((unsigned int)COMMAND_SET_FIXED_CAMERA_POSITION, x, y, z, 0.0f, 0.0f, 0.0f);
+        if (jsonHasKey(json, "targetX") && jsonHasKey(json, "targetY") && jsonHasKey(json, "targetZ")) {
+            float tx = (float)jsonGetNum(json, "targetX");
+            float ty = (float)jsonGetNum(json, "targetY");
+            float tz = (float)jsonGetNum(json, "targetZ");
+            plugin::scripting::CallCommandById((unsigned int)COMMAND_POINT_CAMERA_AT_POINT, tx, ty, tz, 2);
+        }
+        return "{}";
+    }
+
+    if (cmd == "camera_point_at") {
+        if (jsonHasKey(json, "pedHandle")) {
+            CPed* ped = HandleToPed((int)jsonGetNum(json, "pedHandle"));
+            if (ped) plugin::scripting::CallCommandById((unsigned int)COMMAND_POINT_CAMERA_AT_CHAR, ped, 2, 2);
+        } else if (jsonHasKey(json, "vehicleHandle")) {
+            CVehicle* veh = HandleToVehicle((int)jsonGetNum(json, "vehicleHandle"));
+            if (veh) plugin::scripting::CallCommandById((unsigned int)COMMAND_POINT_CAMERA_AT_CAR, veh, 2, 2);
+        } else {
+            float x = (float)jsonGetNum(json, "x");
+            float y = (float)jsonGetNum(json, "y");
+            float z = (float)jsonGetNum(json, "z");
+            plugin::scripting::CallCommandById((unsigned int)COMMAND_POINT_CAMERA_AT_POINT, x, y, z, 2);
+        }
+        return "{}";
+    }
+
+    if (cmd == "camera_restore") {
+        plugin::scripting::CallCommandById((unsigned int)COMMAND_RESTORE_CAMERA_JUMPCUT);
+        return "{}";
+    }
+
+    if (cmd == "camera_fade") {
+        float dur = (float)jsonGetNum(json, "duration", 1.0f);
+        std::string dir = jsonGetStr(json, "direction", "in");
+        short flag = (dir == "out") ? 0 : 1;
+        TheCamera.Fade(dur, flag);
+        return "{}";
+    }
+
+    if (cmd == "camera_shake") {
+        float force = (float)jsonGetNum(json, "intensity", 1.0f);
+        TheCamera.AddShakeSimple(2.0f, 0, force);
+        return "{}";
+    }
+
+    if (cmd == "camera_set_mode") {
+        short mode = (short)jsonGetNum(json, "mode", 4);
+        TheCamera.m_nModeToGoTo = mode;
+        return "{}";
+    }
+
+    // ==========================================
+    // AUDIO & RADIO
+    // ==========================================
+    if (cmd == "audio_play_sound") {
+        int soundId = (int)jsonGetNum(json, "soundId");
+        float vol = (float)jsonGetNum(json, "volume", 1.0f);
+        AudioEngine.ReportFrontendAudioEvent(soundId, vol, 1.0f);
+        return "{}";
+    }
+
+    if (cmd == "audio_set_radio") {
+        int station = (int)jsonGetNum(json, "stationId");
+        AudioEngine.RetuneRadio((char)station);
+        return "{\"stationId\":" + std::to_string(station) + "}";
+    }
+
+    // ==========================================
+    // WORLD, OBJECTS, PICKUPS, FIRES
+    // ==========================================
     if (cmd == "world_set_time") {
         int hour = (int)jsonGetNum(json, "hour");
         int minute = (int)jsonGetNum(json, "minute", 0);
@@ -569,7 +865,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- world_get_time ----
     if (cmd == "world_get_time") {
         std::ostringstream o;
         o << "{\"hour\":" << (int)CClock::ms_nGameClockHours
@@ -577,14 +872,12 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- world_set_weather ----
     if (cmd == "world_set_weather") {
         int wid = (int)jsonGetNum(json, "weatherId");
         CWeather::ForceWeatherNow((short)wid);
         return "{}";
     }
 
-    // ---- world_set_timescale ----
     if (cmd == "world_set_timescale") {
         float scale = (float)jsonGetNum(json, "scale", 1.0);
         if (scale < 0.0f) scale = 0.0f;
@@ -593,7 +886,24 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{\"applied\":" + fmtf(scale) + "}";
     }
 
-    // ---- world_explosion ----
+    if (cmd == "world_set_gravity") {
+        float g = (float)jsonGetNum(json, "gravity", 0.008f);
+        *reinterpret_cast<float*>(0x863984) = g;
+        return "{\"gravity\":" + fmtf(g) + "}";
+    }
+
+    if (cmd == "world_set_traffic_density") {
+        float m = (float)jsonGetNum(json, "multiplier", 1.0f);
+        *reinterpret_cast<float*>(0x8A5B20) = m;
+        return "{\"multiplier\":" + fmtf(m) + "}";
+    }
+
+    if (cmd == "world_set_ped_density") {
+        float m = (float)jsonGetNum(json, "multiplier", 1.0f);
+        *reinterpret_cast<float*>(0x8D2530) = m;
+        return "{\"multiplier\":" + fmtf(m) + "}";
+    }
+
     if (cmd == "world_explosion") {
         CVector pos = { (float)jsonGetNum(json, "x"), (float)jsonGetNum(json, "y"), (float)jsonGetNum(json, "z") };
         int type = (int)jsonGetNum(json, "type", 0);
@@ -601,19 +911,81 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- key_tap ----
-    if (cmd == "key_tap") {
-        int vk = (int)jsonGetNum(json, "keyCode");
-        int frames = (int)jsonGetNum(json, "frames", 2);
-        if (frames < 1) frames = 1;
-        if (frames > 60) frames = 60;
-        if (vk <= 0 || vk > 255) return "{\"error\":\"keyCode must be 1-255 (Windows VK_*)\"}";
-        keybd_event((BYTE)vk, 0, 0, 0);
-        g_pendingKeys.push_back({ vk, frames });
+    if (cmd == "world_create_object") {
+        int modelId = (int)jsonGetNum(json, "modelId");
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+
+        CStreaming::RequestModel(modelId, GAME_REQUIRED);
+        CStreaming::LoadAllRequestedModels(false);
+        if (!CStreaming::HasModelLoaded(modelId)) return "null";
+
+        CObject* obj = CObject::Create(modelId);
+        if (!obj) return "null";
+        obj->SetPosition(x, y, z);
+        obj->UpdateRwMatrix();
+        CWorld::Add(obj);
+        CStreaming::SetModelIsDeletable(modelId);
+
+        int handle = ObjectToHandle(obj);
+        return "{\"handle\":" + std::to_string(handle) + ",\"modelId\":" + std::to_string(modelId) + "}";
+    }
+
+    if (cmd == "world_remove_object") {
+        int handle = (int)jsonGetNum(json, "handle");
+        CObject* obj = HandleToObject(handle);
+        if (!obj) return "null";
+        CWorld::Remove(obj);
+        delete obj;
         return "{}";
     }
 
-    // ---- radar_blips ----
+    if (cmd == "world_create_pickup") {
+        int modelId = (int)jsonGetNum(json, "modelId", 0);
+        int weaponType = (int)jsonGetNum(json, "weaponType", 0);
+        int ammo = (int)jsonGetNum(json, "ammo", 100);
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+        int pType = (int)jsonGetNum(json, "pickupType", 3);
+
+        int pHandle = -1;
+        if (weaponType > 0) {
+            pHandle = CPickups::GenerateNewOne_WeaponType({ x, y, z }, (eWeaponType)weaponType, (unsigned char)pType, ammo, false, nullptr);
+        } else {
+            CStreaming::RequestModel(modelId, GAME_REQUIRED);
+            CStreaming::LoadAllRequestedModels(false);
+            pHandle = CPickups::GenerateNewOne({ x, y, z }, modelId, (unsigned char)pType, ammo, 0, false, nullptr);
+            CStreaming::SetModelIsDeletable(modelId);
+        }
+        return "{\"handle\":" + std::to_string(pHandle) + "}";
+    }
+
+    if (cmd == "world_remove_pickup") {
+        int handle = (int)jsonGetNum(json, "handle");
+        CPickups::RemovePickUp(handle);
+        return "{}";
+    }
+
+    if (cmd == "world_create_fire") {
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+        float size = (float)jsonGetNum(json, "size", 1.0f);
+        gFireManager.StartFire({ x, y, z }, size, 0, nullptr, 10000, 1, 0);
+        return "{}";
+    }
+
+    if (cmd == "world_extinguish_fires") {
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+        float radius = (float)jsonGetNum(json, "radius", 25.0f);
+        gFireManager.ExtinguishPoint({ x, y, z }, radius);
+        return "{}";
+    }
+
     if (cmd == "radar_blips") {
         if (!CRadar::ms_RadarTrace) return "null";
         std::ostringstream o;
@@ -640,7 +1012,23 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- world_pool_dump ----
+    if (cmd == "radar_add_blip") {
+        float x = (float)jsonGetNum(json, "x");
+        float y = (float)jsonGetNum(json, "y");
+        float z = (float)jsonGetNum(json, "z");
+        int color = (int)jsonGetNum(json, "color", 2);
+        int sprite = (int)jsonGetNum(json, "sprite", 0);
+        int blip = CRadar::SetCoordBlip(BLIP_COORD, { x, y, z }, color, BLIP_DISPLAY_BOTH, nullptr);
+        if (sprite > 0) CRadar::SetBlipSprite(blip, sprite);
+        return "{\"blipIndex\":" + std::to_string(blip) + "}";
+    }
+
+    if (cmd == "radar_remove_blip") {
+        int blip = (int)jsonGetNum(json, "blipIndex");
+        CRadar::ClearBlip(blip);
+        return "{}";
+    }
+
     if (cmd == "world_pool_dump") {
         if (!CPools::ms_pPedPool || !CPools::ms_pVehiclePool) return "null";
         float radius = (float)jsonGetNum(json, "radius", 50.0);
@@ -686,7 +1074,112 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- memory_read ----
+    // ==========================================
+    // CHEATS
+    // ==========================================
+    if (cmd == "game_cheat") {
+        std::string name = jsonGetStr(json, "cheat");
+        if (name == "health_armour_money") {
+            CCheat::MoneyArmourHealthCheat();
+        } else if (name == "weapon1") {
+            CCheat::m_aCheatFunctions[CHEAT_WEAPON_SET1]();
+        } else if (name == "weapon2") {
+            CCheat::m_aCheatFunctions[CHEAT_WEAPON_SET2]();
+        } else if (name == "weapon3") {
+            CCheat::m_aCheatFunctions[CHEAT_WEAPON_SET3]();
+        } else if (name == "jetpack") {
+            CCheat::JetpackCheat();
+        } else if (name == "parachute") {
+            CCheat::ParachuteCheat();
+        } else if (name == "never_wanted") {
+            CCheat::NotWantedCheat();
+        } else if (name == "six_stars") {
+            CCheat::m_aCheatFunctions[CHEAT_SIX_WANTED_STARS]();
+        } else if (name == "clear_wanted") {
+            CCheat::m_aCheatFunctions[CHEAT_CLEAR_WANTED_LEVEL]();
+        } else if (name == "infinite_ammo") {
+            CCheat::m_aCheatFunctions[CHEAT_INFINITE_AMMO]();
+        } else if (name == "infinite_health") {
+            CCheat::m_aCheatFunctions[CHEAT_INFINITE_HEALTH]();
+        } else if (name == "blow_up_cars") {
+            CCheat::BlowUpCarsCheat();
+        } else if (name == "cars_fly") {
+            CCheat::m_aCheatFunctions[CHEAT_CARS_FLY]();
+        } else if (name == "cars_on_water") {
+            CCheat::m_aCheatFunctions[CHEAT_CARS_ON_WATER]();
+        } else if (name == "max_stamina") {
+            CCheat::m_aCheatFunctions[CHEAT_MAX_STAMINA]();
+        } else if (name == "max_muscle") {
+            CCheat::MuscleCheat();
+        } else if (name == "max_driving") {
+            CCheat::m_aCheatFunctions[CHEAT_MAX_DRIVING_SKILLS]();
+        } else if (name == "hitman_weapons") {
+            CCheat::m_aCheatFunctions[CHEAT_HITMAN_LEVEL_FOR_ALL_WEAPONS]();
+        } else {
+            return "{\"error\":\"unknown cheat name\"}";
+        }
+        return "{\"cheat\":" + jsonStr(name) + ",\"applied\":true}";
+    }
+
+    // ==========================================
+    // SCRIPT & SCM COMMAND EXECUTION
+    // ==========================================
+    if (cmd == "script_call_opcode") {
+        int opcode = (int)jsonGetNum(json, "opcode");
+        std::string argTypes = jsonGetStr(json, "types");
+        std::string argValues = jsonGetStr(json, "values");
+        
+        DynScriptCode code((short)opcode);
+        std::stringstream ssTypes(argTypes);
+        std::stringstream ssVals(argValues);
+        std::string t, v;
+
+        while (std::getline(ssTypes, t, ',') && std::getline(ssVals, v, ',')) {
+            if (t == "int") {
+                code.AddInt((int)strtol(v.c_str(), nullptr, 10));
+            } else if (t == "float") {
+                code.AddFloat((float)strtod(v.c_str(), nullptr));
+            } else if (t == "str") {
+                code.AddString(v.c_str());
+            } else if (t == "ped") {
+                CPed* p = HandleToPed((int)strtol(v.c_str(), nullptr, 10));
+                code.AddPed(p);
+            } else if (t == "veh") {
+                CVehicle* veh = HandleToVehicle((int)strtol(v.c_str(), nullptr, 10));
+                code.AddVehicle(veh);
+            } else if (t == "obj") {
+                CObject* obj = HandleToObject((int)strtol(v.c_str(), nullptr, 10));
+                code.AddObject(obj);
+            }
+        }
+
+        static CRunningScript script;
+        memset(&script, 0, sizeof(CRunningScript));
+        script.Init();
+        strcpy_s(script.m_szName, "mcp-dyn");
+        script.m_bIsMission = false;
+        script.m_bUseMissionCleanup = false;
+        script.m_bNotFlag = (opcode >> 15) & 1;
+        script.m_pBaseIP = script.m_pCurrentIP = code.data;
+        script.ProcessOneCommand();
+        bool cond = script.m_bCondResult ? true : false;
+        return "{\"opcode\":" + std::to_string(opcode) + ",\"result\":" + (cond ? "true" : "false") + "}";
+    }
+
+    // ==========================================
+    // MEMORY & KEYS
+    // ==========================================
+    if (cmd == "key_tap") {
+        int vk = (int)jsonGetNum(json, "keyCode");
+        int frames = (int)jsonGetNum(json, "frames", 2);
+        if (frames < 1) frames = 1;
+        if (frames > 60) frames = 60;
+        if (vk <= 0 || vk > 255) return "{\"error\":\"keyCode must be 1-255 (Windows VK_*)\"}";
+        keybd_event((BYTE)vk, 0, 0, 0);
+        g_pendingKeys.push_back({ vk, frames });
+        return "{}";
+    }
+
     if (cmd == "memory_read") {
         uintptr_t addr = (uintptr_t)jsonGetNum(json, "address");
         int size = std::min((int)jsonGetNum(json, "size", 4), 1024);
@@ -720,7 +1213,6 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return o.str();
     }
 
-    // ---- memory_write ----
     if (cmd == "memory_write") {
         uintptr_t addr = (uintptr_t)jsonGetNum(json, "address");
         std::string type = jsonGetStr(json, "type");
@@ -743,7 +1235,87 @@ static std::string handleCommand(const std::string& cmd, const std::string& json
         return "{}";
     }
 
-    // ---- plugin_log_read ----
+    if (cmd == "memory_nop") {
+        uintptr_t addr = (uintptr_t)jsonGetNum(json, "address");
+        size_t size = (size_t)jsonGetNum(json, "size", 1);
+        plugin::patch::Nop(addr, size, true);
+        return "{}";
+    }
+
+    if (cmd == "plugin_load") {
+        std::string path = jsonGetStr(json, "path");
+        if (path.empty()) return "{\"error\":\"path required\"}";
+
+        BridgeLog("plugin_load: loading %s", path.c_str());
+        HMODULE hMod = LoadLibraryA(path.c_str());
+        if (!hMod) {
+            DWORD err = GetLastError();
+            BridgeLog("plugin_load: LoadLibrary failed err=%lu", err);
+            return "{\"error\":\"LoadLibrary failed with error " + std::to_string(err) + "\"}";
+        }
+        BridgeLog("plugin_load: loaded successfully %s at %p", path.c_str(), hMod);
+        return "{\"loaded\":true,\"handle\":" + std::to_string(reinterpret_cast<uintptr_t>(hMod)) + "}";
+    }
+
+    if (cmd == "plugin_unload") {
+        std::string name = jsonGetStr(json, "pluginName");
+        if (name.empty()) return "{\"error\":\"pluginName required\"}";
+        if (name.find("debug_bridge") != std::string::npos)
+            return "{\"error\":\"cannot unload debug_bridge.asi itself\"}";
+
+        HMODULE hMod = GetModuleHandleA(name.c_str());
+        if (!hMod) return "{\"error\":\"module not loaded\"}";
+
+        BridgeLog("plugin_unload: unloading %s at %p", name.c_str(), hMod);
+        using UnloadFn = void(*)();
+        UnloadFn fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "GtaMcpUnload"));
+        if (!fn) fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "PluginUnload"));
+        if (!fn) fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "OnUnload"));
+        if (fn) {
+            BridgeLog("plugin_unload: calling exported unload function");
+            fn();
+        }
+
+        FreeLibrary(hMod);
+        return "{\"unloaded\":true}";
+    }
+
+    if (cmd == "plugin_reload") {
+        std::string name = jsonGetStr(json, "pluginName");
+        std::string path = jsonGetStr(json, "path", name);
+        if (name.empty() && path.empty()) return "{\"error\":\"pluginName or path required\"}";
+        if (name.empty()) {
+            size_t slash = path.find_last_of("\\/");
+            name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+        }
+        if (name.find("debug_bridge") != std::string::npos)
+            return "{\"error\":\"cannot reload debug_bridge.asi itself — restart game to update bridge\"}";
+
+        HMODULE hMod = GetModuleHandleA(name.c_str());
+        if (hMod) {
+            BridgeLog("plugin_reload: unloading previous instance of %s at %p", name.c_str(), hMod);
+            using UnloadFn = void(*)();
+            UnloadFn fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "GtaMcpUnload"));
+            if (!fn) fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "PluginUnload"));
+            if (!fn) fn = reinterpret_cast<UnloadFn>(GetProcAddress(hMod, "OnUnload"));
+            if (fn) {
+                BridgeLog("plugin_reload: calling exported unload function");
+                fn();
+            }
+            FreeLibrary(hMod);
+        }
+
+        BridgeLog("plugin_reload: loading %s", path.c_str());
+        HMODULE hNewMod = LoadLibraryA(path.c_str());
+        if (!hNewMod) {
+            DWORD err = GetLastError();
+            BridgeLog("plugin_reload: LoadLibrary failed err=%lu", err);
+            return "{\"error\":\"LoadLibrary failed with error " + std::to_string(err) + "\"}";
+        }
+        BridgeLog("plugin_reload: reloaded successfully %s at %p", path.c_str(), hNewMod);
+        return "{\"reloaded\":true,\"handle\":" + std::to_string(reinterpret_cast<uintptr_t>(hNewMod)) + "}";
+    }
+
     if (cmd == "plugin_log_read") {
         std::string name = jsonGetStr(json, "pluginName");
         bool clear = jsonGetBool(json, "clear", false);
@@ -790,10 +1362,8 @@ static void pipeThread() {
         while (g_running) {
             DWORD avail = 0;
             if (!PeekNamedPipe(g_pipe, nullptr, 0, nullptr, &avail, nullptr))
-                break; // client gone or pipe broken — reconnect
+                break;
 
-            // Flush pending responses every iteration so replies are never
-            // stuck waiting for the next incoming message.
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
                 while (!g_respQueue.empty()) {
@@ -804,7 +1374,7 @@ static void pipeThread() {
                 }
             }
 
-            if (avail == 0) { Sleep(8); continue; } // idle — keep connection alive
+            if (avail == 0) { Sleep(8); continue; }
 
             DWORD read = 0;
             DWORD toRead = std::min(avail, (DWORD)sizeof(chunk));
@@ -812,7 +1382,6 @@ static void pipeThread() {
 
             buf.append(chunk, read);
 
-            // Dispatch complete lines as commands
             size_t pos;
             while ((pos = buf.find('\n')) != std::string::npos) {
                 std::string line = buf.substr(0, pos);
@@ -822,8 +1391,6 @@ static void pipeThread() {
                 int id = (int)jsonGetNum(line, "id");
                 std::string cmd = jsonGetStr(line, "cmd");
 
-                // Scene detection reads only static globals — safe on this thread
-                // even during splash, menu, pause, or loading.
                 bool menuActive = FrontEndMenuManager.m_bMenuActive;
                 bool playerReady = CWorld::Players[0].m_pPed != nullptr;
                 bool cutsceneActive = playerReady &&
@@ -834,7 +1401,6 @@ static void pipeThread() {
                                    : "in_game";
 
                 if (cmd == "game_state") {
-                    // Answered here so scene queries work before gameplay starts.
                     std::ostringstream o;
                     o << "{\"id\":" << id << ",\"ok\":true,\"data\":{\"scene\":\"" << scene
                       << "\",\"menuVisible\":" << (menuActive ? "true" : "false")
@@ -843,10 +1409,6 @@ static void pipeThread() {
                     std::lock_guard<std::mutex> lk(g_mutex);
                     g_respQueue.push_back({ o.str() });
                 } else {
-                    // Queue gameplay commands until the player is active again
-                    // (loading, menu, pause, cutscene). The game thread drains
-                    // the queue once the scene is in_game, or expires it after
-                    // kQueueTtlMs so the client never hangs.
                     std::lock_guard<std::mutex> lk(g_mutex);
                     g_cmdQueue.push_back({ id, cmd, line, GetTickCount64() });
                 }
@@ -867,7 +1429,6 @@ using namespace injector;
 class DebugBridge {
 public:
     DebugBridge() {
-        // Version guard — SA 1.0 US only (Compact + Hoodlum)
         {
             injector::game_version_manager gvm;
             gvm.PluginName = "debug_bridge";
@@ -878,7 +1439,6 @@ public:
             }
         }
 
-        // Check sentinel file — if absent, stay dormant
         char gameDir[MAX_PATH];
         GetModuleFileNameA(nullptr, gameDir, MAX_PATH);
         std::string dir(gameDir);
@@ -886,45 +1446,50 @@ public:
         std::string sentinel = dir + "\\mcp_debug.lock";
 
         if (GetFileAttributesA(sentinel.c_str()) == INVALID_FILE_ATTRIBUTES)
-            return; // not in MCP debug mode — zero overhead
+            return;
 
         g_running = true;
-        g_fastboot = true; // auto-start a new game and skip the intro cutscene
+        g_fastboot = true;
         std::thread(pipeThread).detach();
+        BridgeLog("boot: debug_bridge ctor, debug mode on");
 
-        // Fires every frame during the frontend (splash screens + menu) — the
-        // only reliable hook for bootstrapping straight into a new game.
         Events::menuDrawingEvent += [] {
             if (!g_fastboot) return;
+            static bool s_frontendLogged = false;
+            if (!s_frontendLogged) {
+                s_frontendLogged = true;
+                BridgeLog("boot: frontend draw started");
+            }
             bool playerReady = CWorld::Players[0].m_pPed != nullptr;
             if (!playerReady && ++g_fastbootTimer >= 20) {
                 g_fastbootTimer = 0;
-                // Same function the "New Game" menu button calls.
+                BridgeLog("boot: triggering new game (20 frontend frames)");
                 FrontEndMenuManager.DoSettingsBeforeStartingAGame();
             }
         };
 
         Events::gameProcessEvent += [] {
-            // ---- fast-boot: skip intro cutscene once gameplay exists ----
-            // (The splash/menu phase is handled in menuDrawingEvent, which
-            // fires during the frontend; gameProcessEvent only runs in-game.)
             if (g_fastboot) {
                 bool menuActive = FrontEndMenuManager.m_bMenuActive;
                 bool playerReady = CWorld::Players[0].m_pPed != nullptr;
                 bool cutsceneActive = CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing;
 
                 if (!menuActive && playerReady && cutsceneActive) {
-                    // Intro cutscene — flag it skipped every few frames until done.
+                    static bool s_cutsceneLogged = false;
+                    if (!s_cutsceneLogged) {
+                        s_cutsceneLogged = true;
+                        BridgeLog("boot: intro cutscene detected, skipping");
+                    }
                     if (++g_fastbootTimer >= 5) {
                         g_fastbootTimer = 0;
                         CCutsceneMgr::ms_wasCutsceneSkipped = true;
                     }
                 } else if (!menuActive && playerReady && !cutsceneActive) {
-                    g_fastboot = false; // controllable gameplay reached
+                    g_fastboot = false;
+                    BridgeLog("boot: gameplay reached");
                 }
             }
 
-            // Release injected keys after their frame count expires
             for (auto it = g_pendingKeys.begin(); it != g_pendingKeys.end();) {
                 if (--it->framesLeft <= 0) {
                     keybd_event((BYTE)it->vk, 0, KEYEVENTF_KEYUP, 0);
@@ -936,7 +1501,6 @@ public:
 
             std::lock_guard<std::mutex> lk(g_mutex);
 
-            // Expire stale queued commands so clients never hang waiting.
             ULONGLONG nowMs = GetTickCount64();
             while (!g_cmdQueue.empty() && nowMs - g_cmdQueue.front().receivedAtMs > kQueueTtlMs) {
                 BridgeCommand c = g_cmdQueue.front();
@@ -945,7 +1509,6 @@ public:
                     ",\"ok\":false,\"error\":\"queued command expired waiting for gameplay (15s)\"}" });
             }
 
-            // Only execute queued commands while the player is actually active.
             bool playerReady = CWorld::Players[0].m_pPed != nullptr;
             bool cutsceneActive = CCutsceneMgr::ms_running || CCutsceneMgr::ms_cutsceneProcessing;
             if (!playerReady || cutsceneActive || FrontEndMenuManager.m_bMenuActive)

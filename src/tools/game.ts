@@ -69,6 +69,37 @@ export function registerGameTools(server: McpServer, cfg: Config) {
   );
 
   server.tool(
+    "game_cheat",
+    "Activate an official GTA San Andreas cheat code instantly.",
+    {
+      cheat: z.enum([
+        "health_armour_money",
+        "weapon1",
+        "weapon2",
+        "weapon3",
+        "jetpack",
+        "parachute",
+        "never_wanted",
+        "six_stars",
+        "clear_wanted",
+        "infinite_ammo",
+        "infinite_health",
+        "blow_up_cars",
+        "cars_fly",
+        "cars_on_water",
+        "max_stamina",
+        "max_muscle",
+        "max_driving",
+        "hitman_weapons",
+      ]).describe("Cheat code name to activate"),
+    },
+    async ({ cheat }) => {
+      const data = await send("game_cheat", { cheat });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
     "key_tap",
     "Simulate a keyboard key press inside the game for N frames — tests plugin hotkey handlers without touching the real keyboard.",
     {
@@ -113,9 +144,9 @@ $bmp.Save("${outPath}", [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 Write-Output "OK"
 `;
-      const proc = Bun.spawn(["powershell", "-NoProfile", "-Command", script], { stdout: "pipe", stderr: "pipe" });
-      await proc.exited;
-      const out = (await new Response(proc.stdout).text()).trim();
+      const procCmd = Bun.spawn(["powershell", "-NoProfile", "-Command", script], { stdout: "pipe", stderr: "pipe" });
+      await procCmd.exited;
+      const out = (await new Response(procCmd.stdout).text()).trim();
       if (out !== "OK") {
         return { content: [{ type: "text", text: `Screenshot failed: ${out}` }] };
       }

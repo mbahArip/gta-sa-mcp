@@ -14,7 +14,9 @@
     <ProjectGuid>{BAADF00D-0000-0000-0000-000000000001}</ProjectGuid>
     <RootNamespace>debug_bridge</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <SdkRoot>C:\Users\me\dev\sa_project\plugin-sdk-sa</SdkRoot>
+    <!-- Point at your plugin-sdk checkout: set PLUGIN_SDK_ROOT or edit the fallback. -->
+    <SdkRoot Condition="'$(PLUGIN_SDK_ROOT)' != ''">$(PLUGIN_SDK_ROOT)</SdkRoot>
+    <SdkRoot Condition="'$(SdkRoot)' == ''">$(MSBuildThisFileDirectory)..\..\plugin-sdk-sa</SdkRoot>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
@@ -46,6 +48,9 @@
     </ClCompile>
     <Link>
       <AdditionalDependencies>$(SdkRoot)\output\lib\Plugin.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(TargetName).map</MapFileName>
+      <MapExports>true</MapExports>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">

@@ -32,14 +32,14 @@ export function registerMemoryTools(server: McpServer) {
   );
 
   server.tool(
-    "plugin_log_read",
-    "Read the debug log exported by a loaded .asi plugin. Plugin must export 'GtaMcpDebugLog' (char[]) and 'GtaMcpDebugLen' (int).",
+    "memory_nop",
+    "Patch memory address with NOP (0x90) instructions.",
     {
-      pluginName: z.string().describe("ASI filename e.g. 'myplugin.asi'"),
-      clear:      z.boolean().optional().describe("Clear the log after reading (default false)"),
+      address: z.number().int().describe("Target memory address"),
+      size:    z.number().int().min(1).max(128).optional().describe("Number of NOP bytes to write (default 1)"),
     },
-    async ({ pluginName, clear }) => {
-      const data = await send("plugin_log_read", { pluginName, clear: clear ?? false });
+    async ({ address, size }) => {
+      const data = await send("memory_nop", { address, size: size ?? 1 });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );

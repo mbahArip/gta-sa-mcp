@@ -8,7 +8,12 @@ import { registerPlayerTools } from "./tools/player.ts";
 import { registerVehicleTools } from "./tools/vehicle.ts";
 import { registerPedTools } from "./tools/ped.ts";
 import { registerWorldTools } from "./tools/world.ts";
+import { registerCameraTools } from "./tools/camera.ts";
+import { registerAudioTools } from "./tools/audio.ts";
+import { registerScriptTools } from "./tools/script.ts";
 import { registerMemoryTools } from "./tools/memory.ts";
+import { registerPluginTools } from "./tools/plugin.ts";
+import { registerHelperTools } from "./tools/helper.ts";
 
 const cfg = await loadConfig();
 
@@ -22,9 +27,13 @@ registerPlayerTools(server);
 registerVehicleTools(server);
 registerPedTools(server);
 registerWorldTools(server);
+registerCameraTools(server);
+registerAudioTools(server);
+registerScriptTools(server);
 registerMemoryTools(server);
+registerPluginTools(server);
+registerHelperTools(server);
 
-// Clean up sentinel + pipe on exit
 function cleanup() {
   disconnect();
   deleteSentinel(cfg);
